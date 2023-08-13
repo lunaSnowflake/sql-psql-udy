@@ -22,35 +22,96 @@ Order the data `ascending`, first by `sender`, then by `sequence_start` and fina
 
 ```SQL
 WITH df AS (
+  -- Compute time difference between transactions
   SELECT *,
-         DATEDIFF(minute,LAG(dt) OVER (ORDER BY sender,dt), dt) AS df_minute,
-         ROW_NUMBER() OVER(ORDER BY sender, dt) AS rown
-    FROM transactions
+    CASE 
+      WHEN LAG(sender) OVER (ORDER BY sender, dt) = sender
+      THEN (strftime('%s', dt) - strftime('%s', LAG(dt) OVER (ORDER BY sender, dt))) / 60
+    END AS df_minute
+  FROM transactions
 ),
-rn AS (
-  SELECT rown
-    FROM df
-   WHERE rown IN (SELECT rown
-                    FROM transactions
-                   WHERE abs(df_minute) < 60)
-),
-ss AS (
+fin1 AS (
+  -- Extract rows with 2 or more transactions within an hour
   SELECT *
+  FROM (
+    SELECT *,
+      CASE 
+        WHEN df_minute < 60 OR 
+              ( LEAD(sender) OVER (ORDER BY sender, dt) = sender AND 
+               		LEAD(df_minute) OVER (ORDER BY sender, dt) < 60 )
+        THEN 'Yes' ELSE 'No'
+      END as selection
     FROM df
-   WHERE rown IN (SELECT rown
-                    FROM rn
-                   UNION
-                  SELECT rown - 1 AS rown
-                    FROM rn)
+  ) f
+  WHERE selection = 'Yes'
+),
+fin2 AS (
+  -- Identifying first and last sequence transaction
+  SELECT dt, sender, amount, df_minute,
+  CASE 
+      WHEN df_minute > 60 AND 
+  		( LEAD(df_minute) OVER (ORDER BY sender, dt) < 60 OR 
+         	LEAD(df_minute) OVER (ORDER BY sender, dt) IS NULL ) AND
+        ( LAG(df_minute) OVER (ORDER BY sender, dt) < 60 OR 
+         	LAG(df_minute) OVER (ORDER BY sender, dt) IS NULL )
+      THEN 'Yes'
+  END as is_first_trans,
+  CASE 
+      WHEN df_minute < 60 AND 
+  		( LEAD(df_minute) OVER (ORDER BY sender, dt) > 60 OR 
+         	LEAD(df_minute) OVER (ORDER BY sender, dt) IS NULL )
+      THEN 'Yes'
+  END as is_last_trans
+  FROM fin1
+),
+fin4 AS (
+  -- Computing the sequence transactions' start date
+  SELECT *,
+  CASE 
+      WHEN is_last_trans = 'Yes' 
+      THEN (
+        SELECT f.dt
+        FROM (
+          SELECT dt, 
+          		abs( strftime('%s', f1.dt) - strftime('%s', f2.dt) ) as diff_dt
+          FROM fin2 f2 
+          WHERE (f2.is_first_trans = 'Yes') AND (f2.sender = f1.sender) AND (f2.dt < f1.dt)
+        ) f
+        ORDER BY diff_dt ASC LIMIT 1
+      )
+  END as sequence_start
+  FROM fin2 f1
+),
+fin AS (
+  -- Computing the sequence transactions' total amount and number of transactions
+  SELECT *,
+    CASE
+      WHEN f1.is_last_trans = 'Yes'
+      THEN ( SELECT SUM(amount)
+            FROM fin4 f2
+            WHERE f2.sender = f1.sender AND f2.dt >= f1.sequence_start AND f2.dt <= f1.dt
+           )
+    END transactions_sum,
+    CASE
+      WHEN f1.is_last_trans = 'Yes'
+      THEN ( SELECT COUNT(1)
+            FROM fin4 f2
+            WHERE f2.sender = f1.sender AND f2.dt >= f1.sequence_start AND f2.dt <= f1.dt
+           )
+    END transactions_count
+  FROM fin4 f1
 )
 
-SELECT sender,
-       MIN(dt) AS sequence_start,
-       MAX(dt) AS sequence_end,
-       COUNT(rown) AS transactions_count,
-       SUM(amount) AS transactions_sum
-  FROM ss
- GROUP BY sender
-HAVING SUM(amount) >= 150
- ORDER BY sender, MIN(dt),MAX(dt);  
+SELECT *
+FROM (
+  SELECT sender, 
+          sequence_start, 
+          dt AS sequence_end,
+          transactions_count,
+          transactions_sum
+  FROM fin
+  WHERE is_last_trans = 'Yes'
+) f
+WHERE transactions_sum >= 150
+ORDER BY sender, sequence_start, sequence_end;
 ```
